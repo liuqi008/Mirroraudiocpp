@@ -7,7 +7,7 @@ using NAudio.CoreAudioApi;
 namespace MirrorAudio
 {
     // 依赖类型说明（都在 Program.cs 内定义）：
-    // AppSettings, ShareModeOption, SyncModeOption, StatusSnapshot
+    // AppSettings, ShareModeOption, SyncModeOption, StatusSnapshot, 以及全局 _cfg（包含 ForcePassthrough/ForceRaw/ShowAdvanced）
 
     sealed class SettingsForm : Form
     {
@@ -15,8 +15,8 @@ namespace MirrorAudio
         readonly Label lblRun=new Label(), lblInput=new Label(), lblMain=new Label(), lblAux=new Label(),
                        lblMainFmt=new Label(), lblAuxFmt=new Label(), lblMainBuf=new Label(), lblAuxBuf=new Label(),
                        lblMainPer=new Label(), lblAuxPer=new Label();
-                       readonly Label lblMainReq=new Label(), lblMainQtz=new Label(), lblAuxReq=new Label(), lblAuxQtz=new Label();
-                       readonly Label lblMainPass=new Label(), lblAuxPass=new Label();
+        readonly Label lblMainReq=new Label(), lblMainQtz=new Label(), lblAuxReq=new Label(), lblAuxQtz=new Label();
+        readonly Label lblMainPass=new Label(), lblAuxPass=new Label();
 
         // 右侧设置控件
         readonly ComboBox cmbInput=new ComboBox(), cmbMain=new ComboBox(), cmbAux=new ComboBox(),
@@ -27,6 +27,12 @@ namespace MirrorAudio
                                numRateAux =new NumericUpDown(), numBitsAux =new NumericUpDown(), numBufAux =new NumericUpDown();
 
         readonly CheckBox chkAutoStart=new CheckBox(), chkLogging=new CheckBox();
+
+        // —— 本次修复：把三个复选框升级为“字段”，以便 SaveAndClose 能访问 —— //
+        readonly CheckBox chkForcePass=new CheckBox();
+        readonly CheckBox chkRaw=new CheckBox();
+        readonly CheckBox chkAdvanced=new CheckBox();
+
         readonly Button btnOk=new Button(), btnCancel=new Button(), btnRefresh=new Button(), btnCopy=new Button(), btnReload=new Button();
 
         readonly Func<StatusSnapshot> _statusProvider;
@@ -90,20 +96,30 @@ namespace MirrorAudio
                 Clipboard.SetText(BuildStatusText());
                 MessageBox.Show("状态已复制。", "MirrorAudio", MessageBoxButtons.OK, MessageBoxIcon.Information);
             };
-            
-            var chkForcePass = new CheckBox { Text = "强制直通（能直通就不用重采样）", AutoSize = true }; var chkRaw = new CheckBox { Text = "RAW 优先（尽可能绕 APO）", AutoSize = true };
-            chkForcePass.Checked = _cfg.ForcePassthrough; chkRaw.Checked = _cfg.ForceRaw;
 
-            
-            var chkAdvanced = new CheckBox { Text = "显示高级状态", AutoSize = true };
+            // —— 三个复选框（字段） —— //
+            chkForcePass.Text = "强制直通（能直通就不用重采样）";
+            chkForcePass.AutoSize = true;
+            chkRaw.Text = "RAW 优先（尽可能绕 APO）";
+            chkRaw.AutoSize = true;
+            chkAdvanced.Text = "显示高级状态";
+            chkAdvanced.AutoSize = true;
+
+            // 读取全局 _cfg 的默认值
+            chkForcePass.Checked = _cfg.ForcePassthrough;
+            chkRaw.Checked = _cfg.ForceRaw;
             chkAdvanced.Checked = _cfg.ShowAdvanced;
+
             chkAdvanced.CheckedChanged += (s,e) => {
                 bool v = chkAdvanced.Checked;
                 lblMainReq.Visible = lblMainQtz.Visible = lblAuxReq.Visible = lblAuxQtz.Visible = v;
             };
 
             pBtns.Controls.Add(btnRefresh);
-            pBtns.Controls.Add(btnCopy); pBtns.Controls.Add(chkRaw); pBtns.Controls.Add(chkAdvanced);
+            pBtns.Controls.Add(btnCopy);
+            pBtns.Controls.Add(chkForcePass);
+            pBtns.Controls.Add(chkRaw);
+            pBtns.Controls.Add(chkAdvanced);
 
             grpS.Controls.Add(tblS);
             grpS.Controls.Add(pBtns);
@@ -124,8 +140,6 @@ namespace MirrorAudio
             right.Controls.Add(gOpt);
 
             split.Panel2.Controls.Add(right);
-
-
 
             // 3) 副输出（直播推流）
             var gAux = new GroupBox { Text = "副输出（直播推流）", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10) };
@@ -175,7 +189,6 @@ namespace MirrorAudio
             gMain.Controls.Add(tMain);
             right.Controls.Add(gMain);
 
-
             // 1) 设备（选择并枚举）
             var gDev = new GroupBox { Text = "设备（选择并枚举）", Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(10) };
             var tDev = new TableLayoutPanel { ColumnCount = 2, Dock = DockStyle.Top, AutoSize = true };
@@ -197,6 +210,7 @@ namespace MirrorAudio
             tDev.Controls.Add(btnReload, 1, tDev.RowCount++);
             gDev.Controls.Add(tDev);
             right.Controls.Add(gDev);
+
             // 底部按钮
             var pnlButtons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Dock = DockStyle.Bottom, Padding = new Padding(10), AutoSize = true };
             btnOk.Text = "保存"; btnCancel.Text = "取消";
@@ -279,10 +293,8 @@ namespace MirrorAudio
             sb.AppendLine("副格式: " + (s.AuxFormat??"-"));
             sb.AppendLine("副缓冲: " + (s.AuxBufferMs>0 ? (s.AuxBufferMs + " ms") : "-"));
             sb.AppendLine("副周期: 默认 " + s.AuxDefaultPeriodMs.ToString("0.##") + " ms / 最小 " + s.AuxMinimumPeriodMs.ToString("0.##") + " ms");
-            
             sb.AppendLine("主直通: " + (s.MainMode=="-" ? "-" : (s.MainPassthrough ? "直通" : (s.MainMode=="独占" ? "非直通" : "不适用"))));
             sb.AppendLine("副直通: " + (s.AuxMode=="-"  ? "-" : (s.AuxPassthrough  ? "直通" : (s.AuxMode=="独占"  ? "非直通" : "不适用"))));
-            
             if(_cfg.ShowAdvanced){
                 sb.AppendLine("主缓冲(请求): " + (s.MainBufRequestedMs>0 ? (s.MainBufRequestedMs + " ms") : "-"));
                 sb.AppendLine("主缓冲(量化): " + (s.MainBufQuantizedMs>0 ? (s.MainBufQuantizedMs + " ms") : "-"));
@@ -382,9 +394,11 @@ namespace MirrorAudio
                 EnableLogging = chkLogging.Checked
             };
 
+            // 写回全局 _cfg（由 Program.cs 提供）
             _cfg.ForcePassthrough = chkForcePass.Checked;
-                        _cfg.ForceRaw = chkRaw.Checked;
+            _cfg.ForceRaw = chkRaw.Checked;
             _cfg.ShowAdvanced = chkAdvanced.Checked;
+
             DialogResult = DialogResult.OK;
             Close();
         }
