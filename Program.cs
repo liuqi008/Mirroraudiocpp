@@ -1,6 +1,11 @@
 using System;
+using System.Diagnostics;
 using System.Drawing;
+using System.IO;
 using System.Windows.Forms;
+using Microsoft.Win32;
+using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 
 namespace MirrorAudio
 {
@@ -11,118 +16,140 @@ namespace MirrorAudio
         {
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-            Application.Run(new TrayAppContext());
+            Application.ThreadException += (s,e)=> Debug.WriteLine(e.Exception);
+            using (var app = new TrayApp())
+            {
+                Application.Run();
+            }
         }
     }
 
     /// <summary>
-    /// 托盘应用上下文：保持进程常驻，提供托盘菜单与设置入口。
+    /// 与 2.1 版对齐的托盘常驻应用：菜单、开机自启、设备变更去抖重启。
+    /// 仅做“宿主”与“控制”，音频执行仍在 EngineHost/原生 DLL。
     /// </summary>
-    internal sealed class TrayAppContext : ApplicationContext
+    internal sealed class TrayApp : IDisposable, IMMNotificationClient
     {
-        private readonly NotifyIcon _tray;
-        private SettingsForm _settings;
+        private readonly NotifyIcon _tray = new NotifyIcon();
+        private readonly ContextMenuStrip _menu = new ContextMenuStrip();
+        private readonly Timer _debounce = new Timer { Interval = 400 };
+        private MMDeviceEnumerator _mm = new MMDeviceEnumerator();
 
-        public TrayAppContext()
+        private AppSettings _cfg = ConfigStore.LoadOrDefault();
+
+        public TrayApp()
         {
-            var menu = new ContextMenuStrip();
-            var mOpen = new ToolStripMenuItem("打开设置", null, (s,e) => ShowSettings());
-            var mExit = new ToolStripMenuItem("退出", null, (s,e) => ExitApp());
-            menu.Items.Add(mOpen);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(mExit);
+            // 托盘图标
+            _tray.Icon = TryLoadIcon();
+            _tray.Visible = true;
+            _tray.Text = "MirrorAudio";
+            _tray.DoubleClick += (s,e)=> OnSettings();
 
-            _tray = new NotifyIcon
-            {
-                Text = "MirrorAudio",
-                Icon = TryLoadIcon(),
-                ContextMenuStrip = menu,
-                Visible = true
-            };
-            _tray.DoubleClick += (s,e) => ShowSettings();
+            // 菜单（与 2.1 一致顺序）
+            var miStart = new ToolStripMenuItem("启动/重启(&S)", null, (s,e)=> StartOrRestart());
+            var miStop  = new ToolStripMenuItem("停止(&T)",    null, (s,e)=> Stop());
+            var miSet   = new ToolStripMenuItem("设置(&G)...", null, (s,e)=> OnSettings());
+            var miLog   = new ToolStripMenuItem("打开日志目录", null, (s,e)=> OpenLogDir());
+            var miExit  = new ToolStripMenuItem("退出(&X)",    null, (s,e)=> { Stop(); Application.Exit(); });
 
-            // 初次启动：加载配置并启动引擎
-            var cfg = ConfigStore.LoadOrDefault();
-            EngineHost.StartOrApply(cfg);
+            _menu.Items.Add(miStart);
+            _menu.Items.Add(miStop);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(miSet);
+            _menu.Items.Add(miLog);
+            _menu.Items.Add(new ToolStripSeparator());
+            _menu.Items.Add(miExit);
+            _tray.ContextMenuStrip = _menu;
 
-            // 可选：首次显示设置窗口
-            // ShowSettings();
+            // 设备变更 → 去抖重启
+            _debounce.Tick += (s,e)=> { _debounce.Stop(); StartOrRestart(); };
+            _mm.RegisterEndpointNotificationCallback(this);
+
+            EnsureAutoStart(_cfg.AutoStart);
+            StartOrRestart();
         }
 
         private static Icon TryLoadIcon()
         {
             try
             {
-                // 若 csproj 中配置了 MirrorAudio.ico，会自动嵌入/复制；否则用系统图标兜底
-                return new Icon("MirrorAudio.ico");
+                var icoPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "MirrorAudio.ico");
+                if (File.Exists(icoPath)) return new Icon(icoPath);
+                return Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             }
-            catch
-            {
-                return SystemIcons.Application;
-            }
+            catch { return SystemIcons.Application; }
         }
 
-        private void ShowSettings()
+        private void EnsureAutoStart(bool enable)
         {
-            if (_settings != null && !_settings.IsDisposed)
+            try
             {
-                _settings.Activate();
-                return;
-            }
-
-            var cur = ConfigStore.Current ?? new AppSettings();
-            _settings = new SettingsForm(cur, () => EngineHost.BuildStatus());
-            _settings.FormClosed += OnSettingsClosed;
-            _settings.Show();
+                using (var run=Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (run==null) return;
+                    const string name="MirrorAudio";
+                    if (enable) run.SetValue(name, "\""+Application.ExecutablePath+"\"");
+                    else run.DeleteValue(name, false);
+                }
+            } catch {}
         }
 
-        private void OnSettingsClosed(object sender, FormClosedEventArgs e)
+        private void OpenLogDir()
         {
-            var form = sender as SettingsForm;
-            if (form != null && form.DialogResult == DialogResult.OK && form.Result != null)
+            try
             {
-                // 保存配置并应用到引擎（保持常驻运行，不退出）
-                ConfigStore.Save(form.Result);
-                EngineHost.StartOrApply(form.Result);
-                _tray.BalloonTipTitle = "MirrorAudio";
-                _tray.BalloonTipText = "设置已保存，正在托盘常驻运行。";
-                _tray.ShowBalloonTip(1500);
+                var tmp = Path.GetTempPath();
+                Process.Start("explorer.exe", tmp);
+            } catch {}
+        }
+
+        private void OnSettings()
+        {
+            using (var f = new SettingsForm(_cfg, EngineHost.BuildStatus))
+            {
+                if (f.ShowDialog() == DialogResult.OK)
+                {
+                    _cfg = f.Result;
+                    ConfigStore.Save(_cfg);
+                    EnsureAutoStart(_cfg.AutoStart);
+                    StartOrRestart();
+                }
             }
         }
 
-        private void ExitApp()
+        private void StartOrRestart()
+        {
+            Stop();
+            EngineHost.StartOrApply(_cfg);
+        }
+
+        private void Stop()
         {
             try { EngineHost.Stop(); } catch {}
+        }
+
+        public void Dispose()
+        {
+            try { _mm?.UnregisterEndpointNotificationCallback(this); } catch {}
+            _mm?.Dispose();
+            Stop();
             _tray.Visible = false;
             _tray.Dispose();
-            ExitThread();
+            _menu.Dispose();
         }
+
+        // —— 设备变更回调：全部触发去抖 —— //
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) => Debounce();
+        public void OnDeviceAdded(string pwstrDeviceId) => Debounce();
+        public void OnDeviceRemoved(string deviceId) => Debounce();
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) => Debounce();
+        public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) { }
+        private void Debounce() { _debounce.Stop(); _debounce.Start(); }
     }
 
     /// <summary>
-    /// 配置存储（最小实现）：你可替换为 JSON/注册表等。
-    /// </summary>
-    internal static class ConfigStore
-    {
-        public static AppSettings Current { get; private set; }
-
-        public static AppSettings LoadOrDefault()
-        {
-            // 这里为了最小可运行，直接提供默认配置；你可以改成磁盘持久化
-            Current = Current ?? new AppSettings();
-            return Current;
-        }
-
-        public static void Save(AppSettings cfg)
-        {
-            // TODO: 持久化到文件/注册表；当前仅驻内存保存
-            Current = cfg;
-        }
-    }
-
-    /// <summary>
-    /// 引擎宿主（最小桩）：连接你的音频后端（NAudio 或 C++ DLL）。
-    /// 此处仅维持“运行中”状态 & 回报缓冲/周期占位值，方便 UI 与托盘常驻。
+    /// 连接 render_core.dll 的最小宿主：将 2.1 的“管线创建/缓冲量化/状态回报”迁移到原生层；
+    /// 这里仅负责把 AppSettings → Open 参数、Stop 生命周期、状态查询。
     /// </summary>
     internal static class EngineHost
     {
@@ -130,42 +157,63 @@ namespace MirrorAudio
 
         public static void StartOrApply(AppSettings cfg)
         {
-            // 在这里启动或重配底层音频管线（WASAPI/RAW/独占等）。
-            // 最小桩：仅标记为运行
-            _running = true;
+            // 关闭旧实例
+            Stop();
+
+            // 传入主通道配置（RAW/独占优先）
+            var preferExclusive = cfg.MainShare != ShareModeOption.Shared; // Auto/Exclusive → 独占优先
+            var preferRaw = _cfg.ForceRaw || _cfg.ForcePassthrough;        // “RAW 优先”与“强制直通”任一勾选
+
+            var code = MirrorAudio.Interop.RenderCore.Open(
+                rate: cfg.MainRate,
+                bits: cfg.MainBits,
+                ch: 2,
+                targetMs: cfg.MainBufMs,
+                raw: preferRaw,
+                exclusive: preferExclusive
+            );
+
+            _running = (code == 0);
         }
 
         public static void Stop()
         {
-            _running = false;
-            // TODO: 关闭音频管线
+            if (_running)
+            {
+                MirrorAudio.Interop.RenderCore.Close();
+                _running = false;
+            }
         }
 
         public static StatusSnapshot BuildStatus()
         {
-            // 这里用占位值供 UI 显示；接入真实后端时替换为实际查询。
-            return new StatusSnapshot
-            {
-                Running = _running,
-                InputDevice = "-", InputRole = "-", InputFormat = "-",
-                MainDevice = "-", MainMode = _cfg.ForcePassthrough ? "独占" : "共享",
-                MainSync   = "事件",
-                MainFormat = "PCM 48000/24/2",
-                MainBufferMs = _cfg.ForcePassthrough ? 20 : 60,
-                MainDefaultPeriodMs = 10, MainMinimumPeriodMs = 3,
-                MainPassthrough = _cfg.ForcePassthrough || _cfg.ForceRaw,
-                MainBufRequestedMs = _cfg.ForcePassthrough ? 20 : 60,
-                MainBufQuantizedMs = _cfg.ForcePassthrough ? 20 : 60,
+            var s = new StatusSnapshot();
+            var st = MirrorAudio.Interop.RenderCore.GetStatus();
 
-                AuxDevice = "-", AuxMode = "共享",
-                AuxSync   = "事件",
-                AuxFormat = "PCM 48000/24/2",
-                AuxBufferMs = 80,
-                AuxDefaultPeriodMs = 10, AuxMinimumPeriodMs = 3,
-                AuxPassthrough = false,
-                AuxBufRequestedMs = 80,
-                AuxBufQuantizedMs = 80
-            };
+            s.Running = _running;
+            s.MainDevice = "-";
+            s.MainMode = st.Path == 1 ? "独占" : (st.Path == 2 ? "独占RAW" : "共享");
+            s.MainSync = "事件";
+            s.MainFormat = "-";
+            s.MainBufferMs = st.EffectiveMs;
+            s.MainDefaultPeriodMs = 0;
+            s.MainMinimumPeriodMs = 0;
+            s.MainPassthrough = (st.Path >= 1); // 简化：独占都视作直通；RAW 更优
+            s.MainBufRequestedMs = st.RequestedMs;
+            s.MainBufQuantizedMs = st.QuantizedMs;
+
+            s.AuxDevice = "-";
+            s.AuxMode = "-";
+            s.AuxSync = "-";
+            s.AuxFormat = "-";
+            s.AuxBufferMs = 0;
+            s.AuxDefaultPeriodMs = 0;
+            s.AuxMinimumPeriodMs = 0;
+            s.AuxPassthrough = false;
+            s.AuxBufRequestedMs = 0;
+            s.AuxBufQuantizedMs = 0;
+
+            return s;
         }
     }
 }
