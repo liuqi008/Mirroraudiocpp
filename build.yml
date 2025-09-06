@@ -1,0 +1,34 @@
+name: Build C++ DLL + C# UI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build C++ DLL (render_core)
+        working-directory: ./render_core
+        run: msbuild render_core.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Build C# project
+        run: dotnet build ./MirrorAudio.csproj -c Release -p:PlatformTarget=x64 --no-restore
+
+      - name: Copy DLL to C# bin
+        run: |
+          $dll = Resolve-Path "render_core/bin/Release/render_core.dll"
+          $out = Resolve-Path "bin/Release/net8.0" -ErrorAction SilentlyContinue
+          if (-not $out) { $out = Resolve-Path "." } # adjust as needed
+          Copy-Item $dll $out -Force
