@@ -59,7 +59,7 @@ namespace MirrorAudio.Interop
         }
 
         /// <summary>
-        /// Write PCM bytes. Compatible with旧框架：不使用 ReadOnlySpan。
+        /// 写入 PCM 数据（无需 /unsafe）。
         /// </summary>
         public static int Write(byte[] buffer, int offset, int count)
         {
@@ -67,18 +67,18 @@ namespace MirrorAudio.Interop
             if (offset < 0 || count < 0 || offset + count > buffer.Length) throw new ArgumentOutOfRangeException();
             if (count == 0) return 0;
 
-            unsafe
+            var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+            try
             {
-                fixed (byte* p = &buffer[offset])
-                {
-                    return rc_write((IntPtr)p, count);
-                }
+                IntPtr ptr = Marshal.UnsafeAddrOfPinnedArrayElement(buffer, offset);
+                return rc_write(ptr, count);
+            }
+            finally
+            {
+                handle.Free();
             }
         }
 
-        /// <summary>
-        /// 便捷重载：整个数组。
-        /// </summary>
         public static int Write(byte[] buffer)
         {
             if (buffer == null) return 0;
