@@ -31,10 +31,13 @@ namespace MirrorAudio.Interop
 
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int rc_open(ref RcOpenParams p);
+
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern void rc_close();
+
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern void rc_get_status(out RcStatus s);
+
         [DllImport(DllName, CallingConvention = CallingConvention.Cdecl)]
         private static extern int rc_write(IntPtr data, int bytes);
 
@@ -55,15 +58,31 @@ namespace MirrorAudio.Interop
             return s;
         }
 
-        public static int Write(ReadOnlySpan<byte> pcm)
+        /// <summary>
+        /// Write PCM bytes. Compatible with旧框架：不使用 ReadOnlySpan。
+        /// </summary>
+        public static int Write(byte[] buffer, int offset, int count)
         {
+            if (buffer == null) return 0;
+            if (offset < 0 || count < 0 || offset + count > buffer.Length) throw new ArgumentOutOfRangeException();
+            if (count == 0) return 0;
+
             unsafe
             {
-                fixed (byte* ptr = pcm)
+                fixed (byte* p = &buffer[offset])
                 {
-                    return rc_write((IntPtr)ptr, pcm.Length);
+                    return rc_write((IntPtr)p, count);
                 }
             }
+        }
+
+        /// <summary>
+        /// 便捷重载：整个数组。
+        /// </summary>
+        public static int Write(byte[] buffer)
+        {
+            if (buffer == null) return 0;
+            return Write(buffer, 0, buffer.Length);
         }
     }
 }
