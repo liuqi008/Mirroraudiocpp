@@ -1,4 +1,4 @@
-name: Build C++ DLL + C# UI
+name: Build MirrorAudio
 
 on:
   push:
@@ -9,26 +9,69 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup .NET
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
+          # 统一使用 .NET 8，如需 .NET 9 改为 9.0.x
           dotnet-version: 8.0.x
 
-      - name: Setup MSBuild
+      - name: Setup MSBuild (for C++ / MSBuild projects)
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build C++ DLL (render_core)
-        working-directory: ./render_core
-        run: msbuild render_core.vcxproj /p:Configuration=Release /p:Platform=x64
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
 
-      - name: Build C# project
+      # 还原（解决 NETSDK1004：缺少 obj/project.assets.json）
+      - name: Restore
+        run: dotnet restore ./MirrorAudio.csproj
+
+      # 可选：构建 C++ DLL（render_core），若不存在将跳过
+      - name: Build C++ DLL (optional)
+        shell: pwsh
+        run: |
+          if (Test-Path "render_core/render_core.vcxproj") {
+            msbuild render_core/render_core.vcxproj /p:Configuration=Release /p:Platform=x64
+          } else {
+            Write-Host "render_core project not found. Skipping native DLL build."
+          }
+
+      # 构建 C# 项目（x64）
+      - name: Build C# UI
         run: dotnet build ./MirrorAudio.csproj -c Release -p:PlatformTarget=x64 --no-restore
 
-      - name: Copy DLL to C# bin
+      # 若生成了 render_core.dll，则复制到 C# 输出目录（net* 目标路径下）
+      - name: Copy DLL to managed output (optional)
+        shell: pwsh
         run: |
-          $dll = Resolve-Path "render_core/bin/Release/render_core.dll"
-          $out = Resolve-Path "bin/Release/net8.0" -ErrorAction SilentlyContinue
-          if (-not $out) { $out = Resolve-Path "." } # adjust as needed
-          Copy-Item $dll $out -Force
+          $dll = "render_core/bin/Release/render_core.dll"
+          if (Test-Path $dll) {
+            $outDirs = Get-ChildItem -Path "." -Recurse -Directory -Filter "net*" | Where-Object { $_.FullName -like "*\bin\Release\*" }
+            if ($outDirs.Count -gt 0) {
+              # 优先选择 net8.0-windows 或 net8.0 目录
+              $preferred = $outDirs | Where-Object { $_.FullName -match "net8\.0" } | Select-Object -First 1
+              if (-not $preferred) { $preferred = $outDirs | Select-Object -First 1 }
+              Copy-Item $dll $preferred.FullName -Force
+              Write-Host "Copied render_core.dll to $($preferred.FullName)"
+            } else {
+              Write-Warning "Managed output folder not found. Skipped DLL copy."
+            }
+          } else {
+            Write-Host "No native DLL found. Skipping copy."
+          }
+
+      # 上传构建产物（可在 Actions 页面下载）
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: MirrorAudio-${{ github.sha }}
+          path: |
+            render_core/bin/Release/*.dll
+            **/bin/Release/**/*
